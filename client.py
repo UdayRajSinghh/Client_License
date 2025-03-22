@@ -37,38 +37,122 @@ TwIDAQAB
 AES_KEY = bytes.fromhex('08bfb5a91d43c4d48600fee85fed9cfe52f945dcca1533a328cd2a1b1ef2942f')  # Example key - REPLACE THIS
 
 LICENSE_FILE = 'license_info.json'
-
 def get_hardware_id():
     """
-    Generate a hardware ID based on motherboard serial number and BIOS UUID or version.
+    Generate a stable hardware ID for Windows systems that works in both script and executable modes.
+    Uses multiple hardware identifiers with fallbacks for maximum reliability.
     """
-    motherboard_id = "unknown"
-    bios_id = "unknown"
-
-    # Platform-specific logic
-    if platform.system() == "Windows" and wmi:
+    import subprocess
+    import re
+    import os
+    import uuid
+    import hashlib
+    import ctypes
+    from ctypes import windll, wintypes
+    
+    hardware_identifiers = []
+    
+    # Get Volume Serial Number (very stable - only changes if drive is reformatted)
+    try:
+        # Get system drive (usually C:)
+        system_drive = os.environ.get('SystemDrive', 'C:')
+        
+        # Use WinAPI to get volume serial number
+        volume_name_buffer = ctypes.create_unicode_buffer(1024)
+        filesystem_name_buffer = ctypes.create_unicode_buffer(1024)
+        serial_number = wintypes.DWORD(0)
+        
+        result = windll.kernel32.GetVolumeInformationW(
+            ctypes.c_wchar_p(system_drive + '\\'),
+            volume_name_buffer,
+            ctypes.sizeof(volume_name_buffer),
+            ctypes.byref(serial_number),
+            None,
+            None,
+            filesystem_name_buffer,
+            ctypes.sizeof(filesystem_name_buffer)
+        )
+        
+        if result != 0:
+            volume_serial = f"{serial_number.value:08X}"
+            hardware_identifiers.append(f"vol:{volume_serial}")
+    except Exception:
+        pass
+    
+    # Get CPU ID (very stable - only changes if CPU is replaced)
+    try:
+        wmic_output = subprocess.check_output(
+            "wmic cpu get processorid", 
+            shell=True, 
+            stderr=subprocess.STDOUT
+        ).decode('utf-8', errors='ignore')
+        
+        # Extract the processor ID
+        match = re.search(r'ProcessorId\s*\n\s*([^\s,]+)', wmic_output, re.IGNORECASE)
+        if match and match.group(1):
+            cpu_id = match.group(1).strip()
+            hardware_identifiers.append(f"cpu:{cpu_id}")
+    except Exception:
+        pass
+    
+    # Get motherboard serial (very stable - tied to physical hardware)
+    try:
+        wmic_output = subprocess.check_output(
+            "wmic baseboard get serialnumber", 
+            shell=True, 
+            stderr=subprocess.STDOUT
+        ).decode('utf-8', errors='ignore')
+        
+        # Extract the serial number
+        match = re.search(r'SerialNumber\s*\n\s*([^\s,]+)', wmic_output, re.IGNORECASE)
+        if match and match.group(1) and match.group(1).strip() not in ('None', 'To be filled by O.E.M.'):
+            mb_serial = match.group(1).strip()
+            hardware_identifiers.append(f"mb:{mb_serial}")
+    except Exception:
+        pass
+    
+    # Get BIOS serial as fallback
+    try:
+        wmic_output = subprocess.check_output(
+            "wmic bios get serialnumber", 
+            shell=True, 
+            stderr=subprocess.STDOUT
+        ).decode('utf-8', errors='ignore')
+        
+        # Extract the serial number
+        match = re.search(r'SerialNumber\s*\n\s*([^\s,]+)', wmic_output, re.IGNORECASE)
+        if match and match.group(1) and match.group(1).strip() not in ('None', 'To be filled by O.E.M.'):
+            bios_serial = match.group(1).strip()
+            hardware_identifiers.append(f"bios:{bios_serial}")
+    except Exception:
+        pass
+    
+    # MAC address as additional identifier
+    try:
+        mac = uuid.getnode()
+        # Only use if it's not a random MAC (check if the locally administered bit is not set)
+        if not (mac & 0x020000000000):
+            mac_str = ':'.join(['{:02x}'.format((mac >> elements) & 0xff) for elements in range(0, 8*6, 8)][::-1])
+            hardware_identifiers.append(f"mac:{mac_str}")
+    except Exception:
+        pass
+    
+    # Fallback to machine name if everything else fails
+    if not hardware_identifiers:
         try:
-            # Use WMI to get motherboard and BIOS info on Windows
-            c = wmi.WMI()
-            # Motherboard serial number
-            for board in c.Win32_BaseBoard():
-                motherboard_id = board.SerialNumber.strip() if board.SerialNumber else "unknown"
-            # BIOS UUID or version
-            for bios in c.Win32_BIOS():
-                bios_id = bios.SerialNumber.strip() or bios.SMBIOSBIOSVersion.strip() or "unknown"
+            import socket
+            hardware_identifiers.append(f"name:{socket.gethostname()}")
         except Exception:
-            pass
-    else:
-        # Fallback for unsupported platforms (e.g., macOS)
-        motherboard_id = str(uuid.getnode())  # MAC address as a fallback
-        bios_id = platform.machine()  # Machine architecture as a fallback
-
-    # Combine the parameters into a raw ID
-    raw_id = f"{motherboard_id}-{bios_id}"
-
-    # Generate a 16-character SHA-256 hash
-    return hashlib.sha256(raw_id.encode()).hexdigest()[:16]
-
+            # Last resort - use a combination of system info
+            import platform
+            hardware_identifiers.append(f"sys:{platform.system()}_{platform.machine()}_{os.getenv('USERNAME')}")
+    
+    # Create a combined hardware string and hash it
+    combined_hardware = "||".join(hardware_identifiers)
+    
+    # Return a 16-character SHA-256 hash
+    return hashlib.sha256(combined_hardware.encode()).hexdigest()[:16]
+    
 def save_license_info(license_dict):
     """Save the license information to a local file."""
     with open(LICENSE_FILE, 'w') as f:
